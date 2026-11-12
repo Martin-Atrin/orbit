@@ -58,7 +58,7 @@ import type {
 } from '@orbit/api/generated/types.gen'
 import { ApiProblem } from '@orbit/api/problem'
 import { getPasskey } from '@/features/auth/passkey'
-import { codeChallenge, createCodeVerifier, saveProviderFlow } from '@/features/auth/providerSignIn'
+import { codeChallenge, createCodeVerifier, providerName, saveProviderFlow } from '@/features/auth/providerSignIn'
 
 type ApiClient = ReturnType<typeof createApiClient>
 
@@ -309,6 +309,12 @@ export function useAuthOptions() {
       return data
     },
   })
+}
+
+/** The name of a sign-in provider; OpenID Connect uses the label from the auth options. */
+export function useProviderName() {
+  const oidcName = useAuthOptions().data?.oidc_name
+  return (provider: Provider) => providerName(provider, oidcName)
 }
 
 export function useRequestRegistration() {

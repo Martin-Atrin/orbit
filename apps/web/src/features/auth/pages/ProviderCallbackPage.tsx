@@ -2,13 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { ApiProblem } from '@orbit/api/problem'
-import { useProviderExchange } from '@/features/auth/api'
+import { useProviderExchange, useProviderName } from '@/features/auth/api'
 import { AuthCard } from '@/features/auth/components/AuthForm'
 import { AuthMessage } from '@/features/auth/components/AuthMessage'
 import { LinkPasswordStep } from '@/features/auth/components/LinkPasswordStep'
 import { TwoFactorStep } from '@/features/auth/components/TwoFactorStep'
 import { loginDestination } from '@/features/auth/returnTo'
-import { clearProviderFlow, parseProviderCallback, PROVIDER_NAMES, storedProviderFlow } from '@/features/auth/providerSignIn'
+import { clearProviderFlow, parseProviderCallback, storedProviderFlow } from '@/features/auth/providerSignIn'
 
 /** Where a `connect` or `confirm` goes back to: the account page that started it. */
 function settingsDestination(returnTo: string | null) {
@@ -16,13 +16,14 @@ function settingsDestination(returnTo: string | null) {
 }
 
 /**
- * `/login/callback#handoff=…`: the server's redirect back from Google or GitHub. Trades the handoff and this tab's
+ * `/login/callback#handoff=…`: the server's redirect back from Google, GitHub or the OIDC provider. Trades the handoff and this tab's
  * verifier for a session (or a code step), or finishes a `connect` / `confirm` for the signed-in account.
  */
 export function ProviderCallbackPage() {
   const location = useLocation()
   const navigate = useNavigate()
   const exchange = useProviderExchange()
+  const providerName = useProviderName()
   const [callback] = useState(() => ({ ...parseProviderCallback(location.hash), flow: storedProviderFlow() }))
   const [codeStepError, setCodeStepError] = useState<Error | null>(null)
   // The password step of a first link can lead to a code step of its own.
@@ -41,12 +42,12 @@ export function ProviderCallbackPage() {
       onSuccess: (result) => {
         if (result.kind === 'signed_in') void navigate(loginDestination(returnTo), { replace: true })
         if (result.kind === 'done') {
-          toast(flow.intent === 'connect' ? `${PROVIDER_NAMES[flow.provider]} is connected` : `Confirmed with ${PROVIDER_NAMES[flow.provider]}. Try the change again.`)
+          toast(flow.intent === 'connect' ? `${providerName(flow.provider)} is connected` : `Confirmed with ${providerName(flow.provider)}. Try the change again.`)
           void navigate(settingsDestination(returnTo), { replace: true })
         }
       },
     })
-  }, [exchange, flow, handoff, location.pathname, navigate, returnTo])
+  }, [exchange, flow, handoff, location.pathname, navigate, providerName, returnTo])
 
   const signingIn = !flow || flow.intent === 'sign_in'
   const error = codeStepError ?? exchange.error

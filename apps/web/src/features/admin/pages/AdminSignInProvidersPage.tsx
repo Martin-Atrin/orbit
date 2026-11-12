@@ -16,16 +16,20 @@ import { PROVIDER_NAMES } from '@/features/auth/providerSignIn'
 import { FieldGrid, RequiredMark } from '@/features/settings/components/SettingsParts'
 import { LoadingText } from '@/components/ui/spinner'
 
-const PROVIDERS: { provider: Provider; variable: string; description: string }[] = [
+const PROVIDERS: { provider: Provider; variable: string | null; description: string }[] = [
   { provider: 'google', variable: 'ORBIT_GOOGLE_*', description: 'Create a client of type "Web application" in Google Cloud Console (APIs & Services → Credentials) and add the callback URL as an authorized redirect URI.' },
   { provider: 'github', variable: 'ORBIT_GITHUB_*', description: 'Register an app in GitHub (Settings → Developer settings → OAuth Apps) with the callback URL as its authorization callback URL.' },
+  { provider: 'oidc', variable: null, description: 'Any OpenID Connect provider: Authentik, Keycloak, Zitadel, Entra ID, Okta. Create a confidential OAuth2/OpenID client with the callback URL as its redirect URI. Orbit reads the endpoints from the issuer\'s discovery document.' },
 ]
+
+/** The card title; the OIDC button label is the admin's own. */
+const CARD_TITLES: Record<Provider, string> = { ...PROVIDER_NAMES, oidc: 'OpenID Connect' }
 
 function problemText(error: unknown, fallback: string) {
   return error instanceof ApiProblem ? error.detail : fallback
 }
 
-/** "Continue with Google / GitHub" on the sign-in page: the client each provider issued to this Orbit. */
+/** "Continue with Google / GitHub / an OIDC provider" on the sign-in page: the client each provider issued to this Orbit. */
 export function AdminSignInProvidersPage() {
   const settings = useInstanceSettings()
   if (settings.isPending) return <SettingsCard title="Sign-in providers"><p><LoadingText>Loading settings…</LoadingText></p></SettingsCard>
@@ -34,7 +38,7 @@ export function AdminSignInProvidersPage() {
     <>
       {PROVIDERS.map(({ provider, variable, description }) => {
         const saved = settings.data.sign_in_providers.find((item) => item.provider === provider) ?? null
-        const lockedBy = settings.data.environment.sign_in_providers.includes(provider) ? variable : null
+        const lockedBy = variable && settings.data.environment.sign_in_providers.includes(provider) ? variable : null
         // Remount on save so the form shows what the server stored.
         return <ProviderCard key={`${provider}:${JSON.stringify(saved)}`} provider={provider} description={description} saved={saved} lockedBy={lockedBy} />
       })}
@@ -49,15 +53,19 @@ function ProviderCard({ provider, description, saved, lockedBy }: { provider: Pr
   const remove = useRemoveSignInProvider()
   const [clientId, setClientId] = useState(saved?.client_id ?? '')
   const [secret, setSecret] = useState('')
+  const [displayName, setDisplayName] = useState(saved?.display_name ?? '')
+  const [issuer, setIssuer] = useState(saved?.issuer ?? '')
+  const [scopes, setScopes] = useState(saved?.scopes ?? '')
   const id = useId()
-  const name = PROVIDER_NAMES[provider]
+  const oidc = provider === 'oidc'
+  const name = CARD_TITLES[provider]
   // The server reports the callback URL of saved providers only; before the first save it is this origin's.
   const callbackUrl = saved?.callback_url ?? `${window.location.origin}/api/v1/auth/providers/${provider}/callback`
 
   async function removeProvider() {
     const confirmed = await confirmAction({
       title: `Remove ${name}?`,
-      description: `"Continue with ${name}" disappears from the sign-in page. Accounts that only sign in with ${name} need a password reset to get back in.`,
+      description: `"Continue with ${oidc ? saved?.display_name ?? name : name}" disappears from the sign-in page. Accounts that only sign in with ${name} need a password reset to get back in.`,
       confirmLabel: 'Remove',
       danger: true,
     })
@@ -71,7 +79,8 @@ function ProviderCard({ provider, description, saved, lockedBy }: { provider: Pr
   return (
     <form onSubmit={(event) => {
       event.preventDefault()
-      save.mutate({ provider, body: { client_id: clientId.trim(), client_secret: secret || null } }, {
+      const oidcFields = oidc ? { display_name: displayName.trim(), issuer: issuer.trim(), scopes: scopes.trim() } : {}
+      save.mutate({ provider, body: { client_id: clientId.trim(), client_secret: secret || null, ...oidcFields } }, {
         onSuccess: () => toast(`${name} saved`),
         onError: (error) => toast.error(problemText(error, `${name} could not be saved.`)),
       })
@@ -89,6 +98,18 @@ function ProviderCard({ provider, description, saved, lockedBy }: { provider: Pr
               </Button>
             </div>
           </Field>
+          {oidc ? (
+            <>
+              <Field>
+                <FieldLabel htmlFor={`${id}-display-name`}>Button label <RequiredMark /> <InfoTip text='The sign-in page shows "Continue with" and this label, for example "Authentik".' /></FieldLabel>
+                <Input id={`${id}-display-name`} required maxLength={40} autoComplete="off" value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor={`${id}-issuer`}>Issuer URL <RequiredMark /> <InfoTip text="Exactly as the provider's discovery document reports it, trailing slash included. Authentik: https://auth.example.com/application/o/<slug>/" /></FieldLabel>
+                <Input id={`${id}-issuer`} type="url" required autoComplete="off" spellCheck={false} className="font-mono" value={issuer} onChange={(event) => setIssuer(event.target.value)} />
+              </Field>
+            </>
+          ) : null}
           <Field>
             <FieldLabel htmlFor={`${id}-client-id`}>Client ID <RequiredMark /></FieldLabel>
             <Input id={`${id}-client-id`} required autoComplete="off" spellCheck={false} disabled={locked} value={clientId} onChange={(event) => setClientId(event.target.value)} />
@@ -97,6 +118,12 @@ function ProviderCard({ provider, description, saved, lockedBy }: { provider: Pr
             <FieldLabel htmlFor={`${id}-secret`}>Client secret {saved?.secret_set ? null : <RequiredMark />} <InfoTip text="Stored encrypted." /></FieldLabel>
             <PasswordInput id={`${id}-secret`} autoComplete="new-password" required={!saved?.secret_set} placeholder={saved?.secret_set ? 'Saved. Leave empty to keep it.' : ''} disabled={locked} value={secret} onChange={(event) => setSecret(event.target.value)} />
           </Field>
+          {oidc ? (
+            <Field className="min-[900px]:col-span-2">
+              <FieldLabel htmlFor={`${id}-scopes`}>Extra scopes <InfoTip text="Orbit always asks for openid, email and profile. Add more, separated by spaces, if your provider needs them." /></FieldLabel>
+              <Input id={`${id}-scopes`} autoComplete="off" spellCheck={false} className="font-mono" value={scopes} onChange={(event) => setScopes(event.target.value)} />
+            </Field>
+          ) : null}
         </FieldGrid>
         <div className="mt-4 flex items-center justify-end gap-2">
           {lockedBy ? <SetByEnvironment variable={lockedBy} className="mr-auto" /> : null}

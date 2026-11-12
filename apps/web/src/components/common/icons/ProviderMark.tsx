@@ -1,8 +1,10 @@
 import type { SVGProps } from 'react'
+import { Key } from 'reicon-react'
 import type { Provider } from '@orbit/api/generated/types.gen'
 
-/** The Google "G" in its brand colors, or the GitHub mark in the text color. */
+/** The Google "G" in its brand colors, the GitHub mark in the text color, or a key for any OpenID Connect provider. */
 export function ProviderMark({ provider, ...props }: { provider: Provider } & SVGProps<SVGSVGElement>) {
+  if (provider === 'oidc') return <Key aria-hidden="true" data-provider="oidc" {...props} />
   if (provider === 'google') {
     return (
       <svg viewBox="0 0 48 48" aria-hidden="true" data-provider="google" {...props}>

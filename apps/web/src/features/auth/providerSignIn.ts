@@ -1,10 +1,15 @@
 /**
- * The browser side of "Continue with Google / GitHub": a PKCE verifier kept in this tab while the provider's page is
+ * The browser side of "Continue with Google / GitHub / your OIDC provider": a PKCE verifier kept in this tab while the provider's page is
  * open, and the handoff the server puts in the `/login/callback` fragment.
  */
 import type { Provider, SignInIntent } from '@orbit/api/generated/types.gen'
 
-export const PROVIDER_NAMES: Record<Provider, string> = { google: 'Google', github: 'GitHub' }
+export const PROVIDER_NAMES: Record<Provider, string> = { google: 'Google', github: 'GitHub', oidc: 'SSO' }
+
+/** A provider's name. OpenID Connect shows the label the admin chose (`oidc_name` of the auth options). */
+export function providerName(provider: Provider, oidcName?: string | null): string {
+  return provider === 'oidc' && oidcName ? oidcName : PROVIDER_NAMES[provider]
+}
 
 /** What the tab remembers between leaving for the provider and coming back to `/login/callback`. */
 export type ProviderFlow = { provider: Provider; intent: SignInIntent; verifier: string }
@@ -36,7 +41,7 @@ export function saveProviderFlow(flow: ProviderFlow) {
 export function storedProviderFlow(): ProviderFlow | null {
   try {
     const value = JSON.parse(sessionStorage.getItem(FLOW_KEY) ?? 'null') as Partial<ProviderFlow> | null
-    if (!value || !(value.provider === 'google' || value.provider === 'github') || typeof value.verifier !== 'string') return null
+    if (!value || !(value.provider === 'google' || value.provider === 'github' || value.provider === 'oidc') || typeof value.verifier !== 'string') return null
     if (!(value.intent === 'sign_in' || value.intent === 'connect' || value.intent === 'confirm')) return null
     return { provider: value.provider, intent: value.intent, verifier: value.verifier }
   } catch {
