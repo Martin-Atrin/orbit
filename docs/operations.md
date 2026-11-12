@@ -74,7 +74,7 @@ The variables of one group are set together. For example, `ORBIT_SMTP_HOST` need
 | `ORBIT_AUTOMATIC_BACKUPS` | saved value | `off`, `hourly` or `daily`. |
 | `ORBIT_S3_KEEP_DELETED_DAYS` | saved value (40) | 1 to 365: the days a deleted or replaced attachment file stays in S3 before Orbit deletes it. Backups do not contain S3 files, so a restore from a backup older than this can miss files. |
 | `ORBIT_OPEN_REGISTRATION` | saved value | `true` or `false`. `true` requires `ORBIT_SMTP_*` or a provider variable below. On Orbit Cloud, it requires `ORBIT_SMTP_*`. |
-| `ORBIT_GOOGLE_CLIENT_ID`, `ORBIT_GOOGLE_CLIENT_SECRET`, `ORBIT_GOOGLE_CLIENT_SECRET_FILE` | none | The Google OAuth client. Set the ID and the secret together. See [Sign in with Google and GitHub](#sign-in-with-google-and-github). |
+| `ORBIT_GOOGLE_CLIENT_ID`, `ORBIT_GOOGLE_CLIENT_SECRET`, `ORBIT_GOOGLE_CLIENT_SECRET_FILE` | none | The Google OAuth client. Set the ID and the secret together. See [Sign in with Google, GitHub and OpenID Connect](#sign-in-with-google-github-and-openid-connect). |
 | `ORBIT_GITHUB_CLIENT_ID`, `ORBIT_GITHUB_CLIENT_SECRET`, `ORBIT_GITHUB_CLIENT_SECRET_FILE` | none | The GitHub OAuth client. Set the ID and the secret together. |
 
 Orbit does not test the `ORBIT_S3_*` bucket at startup, as Admin does when it saves one. An unreachable bucket shows up as a move error on **Admin → Storage** and as failed backups. Orbit refuses to start when a workspace's own bucket overlaps the `ORBIT_S3_*` bucket.
@@ -172,7 +172,7 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml start orbit
 
 Orbit sends email only for invitations, open-registration sign-up links, password reset links and email changes. The root user saves the SMTP server in **Admin → Settings → Email** and checks it with **Send test email**. Without a mail server, invitations are shared as links and password recovery works as described below. Orbit Cloud is different: it always needs a mail server (see [Billing](#billing-orbit-cloud)).
 
-Registration is closed after setup: people join only by invitation. The root user can turn on **Open registration** in **Admin → Settings** once a mail server or a [sign-in provider](#sign-in-with-google-and-github) is saved. On Orbit Cloud, only a mail server counts. A new person then enters their email, opens the emailed link (60 minutes, one use) and chooses a name and password. Removing the mail server closes registration.
+Registration is closed after setup: people join only by invitation. The root user can turn on **Open registration** in **Admin → Settings** once a mail server or a [sign-in provider](#sign-in-with-google-github-and-openid-connect) is saved. On Orbit Cloud, only a mail server counts. A new person then enters their email, opens the emailed link (60 minutes, one use) and chooses a name and password. Removing the mail server closes registration.
 
 A person changes their email in **Account → Profile** (needs a mail server). Orbit asks for the current password (or a sign-in in the last 10 minutes for an account without one) and emails a one-use link, valid for 60 minutes, to the new address. The email changes only when the link is opened: the address is verified, every other session of the account is signed out, open password reset links stop working, and the old address gets a notice ("Your Orbit email was changed") that names the new address. Like registration, the request never tells whether another account has the new address: Orbit then sends nothing. If someone takes the address before the link is opened, the link answers `409 email_taken`. On Orbit Cloud, the Stripe customer of each workspace the person owns gets the new address (job `billing.stripe_customer_email`), so receipts follow the owner.
 
@@ -200,14 +200,15 @@ One key sends to both APNs hosts: the app tells the server whether its device to
 
 A phone gets pushes like a browser: only while the session that registered it is valid, and not while the person is active in an open tab or in the app (its live connection). Revoking or deleting the session stops them. APNs answers for a token that is no longer valid (`410`, `BadDeviceToken`, `DeviceTokenNotForTopic`) remove the phone; the app registers it again when it starts. Other refusals (for example `403 InvalidProviderToken` for a wrong key ID or team ID) are logged as `APNs push not sent` and keep the phone.
 
-## Sign in with Google and GitHub
+## Sign in with Google, GitHub and OpenID Connect
 
-People can sign in with a Google or GitHub account when the root user configures the provider. A provider that is not configured does not show on the sign-in pages.
+People can sign in with a Google or GitHub account, or with an account at one OpenID Connect (OIDC) provider (Authentik, Keycloak, Zitadel, Entra ID, Okta and others), when the root user configures the provider. A provider that is not configured does not show on the sign-in pages.
 
 Each provider needs an OAuth client. Register this callback URL at the provider. Replace `{ORBIT_PUBLIC_ORIGIN}` with the public origin of the server:
 
 - Google: `{ORBIT_PUBLIC_ORIGIN}/api/v1/auth/providers/google/callback`
 - GitHub: `{ORBIT_PUBLIC_ORIGIN}/api/v1/auth/providers/github/callback`
+- OpenID Connect: `{ORBIT_PUBLIC_ORIGIN}/api/v1/auth/providers/oidc/callback`
 
 To create the Google client:
 
@@ -224,12 +225,39 @@ To create the GitHub client:
 3. Register the app. Generate a client secret.
 4. Copy the client ID and the client secret.
 
+To create the OpenID Connect client:
+
+1. At the provider, create a confidential client (a client with a secret) for the authorization code flow.
+2. Set the OIDC callback URL as the redirect URI.
+3. Give the client the scopes `openid`, `email` and `profile`. Orbit always asks for them.
+4. Copy the client ID, the client secret and the issuer URL.
+
+In **Admin → Sign-in providers → OpenID Connect**, also enter these values:
+
+- **Button label**: the sign-in page shows "Continue with" and this label, for example "Authentik".
+- **Issuer URL**: the issuer exactly as the provider's discovery document reports it, trailing slash included. When you save, Orbit reads `{issuer}/.well-known/openid-configuration`. Orbit refuses the save if it cannot read the document or if the document reports another issuer. The error shows the issuer that the provider reports. The issuer must use `https` (`http` is accepted only for `localhost` and loopback addresses).
+- **Extra scopes** (optional): more scopes, separated by spaces, if your provider needs them.
+
+Orbit uses the authorization code flow with PKCE (S256), a `state` and a `nonce`. Orbit reads the endpoints from the discovery document at each sign-in. The ID token from the token endpoint must name the issuer, the client ID and the nonce, and it must not be expired. Orbit gets the token directly from the provider over TLS, so it does not check the token signature (OpenID Connect Core 3.1.3.7). Orbit reads the email, `email_verified` and the name from the userinfo endpoint, which must report the same `sub` as the ID token. The client authenticates with HTTP Basic (`client_secret_basic`), or with `client_secret_post` when the provider supports only that method.
+
+Example with Authentik:
+
+1. In Authentik, open **Applications → Providers → Create**. Select **OAuth2/OpenID Provider**.
+2. Set **Client type** to **Confidential**. Add the OIDC callback URL as a **Redirect URI** with the **Strict** match.
+3. Keep the default scope mappings `openid`, `email` and `profile`. Save the provider.
+4. Open **Applications → Applications → Create**. Give the application a slug, for example `orbit`, and select the provider.
+5. Copy the client ID and the client secret from the provider.
+6. The issuer URL is `https://<authentik>/application/o/<slug>/`, for example `https://auth.example.com/application/o/orbit/`. The provider page in Authentik shows it as **OpenID Configuration Issuer**.
+
+Authentik sends `email_verified` from its `email` scope mapping. If a first sign-in fails with "Email not verified", look at what this mapping sends in your Authentik version. Change it to send `email_verified: true` only for addresses that you trust.
+
 Then open **Admin → Sign-in providers**. Enter the client ID and the client secret, and save. Orbit encrypts the secret with the app key. To change only the client ID, leave the secret empty: Orbit keeps the saved secret. **Remove** stops the provider. Accounts keep their connections, so if you save the provider again, these accounts can sign in with it again.
 
 Orbit uses these rules:
 
 - Orbit finds an account by the provider account ID, not by the email. A changed provider email does not change the account.
-- A first sign-in connects to the Orbit account with the same email only if the provider verified that email. Google must report the email as verified. GitHub must have a verified primary email.
+- A first sign-in connects to the Orbit account with the same email only if the provider verified that email. Google must report the email as verified. GitHub must have a verified primary email. An OpenID Connect provider must report `email_verified: true`. Providers that do not send `email_verified` (for example Entra ID) cannot link or create accounts: people connect them in their security settings instead.
+- An OpenID Connect account is found by its issuer and its `sub`. If you save another issuer URL, Orbit disconnects all accounts that were connected to the old issuer, because a `sub` means nothing at another issuer. People sign in again with the new provider, and Orbit links them by their verified email.
 - If no account has that email, Orbit creates an account only when **Open registration** is on. Open registration does not need a mail server when a sign-in provider is configured (Orbit Cloud still needs one). A new account has no password. The person can add one in the profile settings within 10 minutes of a sign-in.
 - An account with two-factor authentication must still enter its code after the provider sign-in.
 - People connect and disconnect providers in their security settings. Orbit does not let a person remove the last sign-in method (password, passkey or provider).
