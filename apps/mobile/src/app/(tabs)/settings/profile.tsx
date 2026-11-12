@@ -170,7 +170,8 @@ function EmailField() {
 function SignInMethods() {
   const { user } = useOrbit()
   const connected = useConnectedAccounts()
-  const methods = signInMethods(user.has_password, connected.data ?? [])
+  const oidcName = useAuthOptions().data?.oidc_name
+  const methods = signInMethods(user.has_password, connected.data ?? [], oidcName)
   if (methods.length === 0) return null
   return (
     <Text className="text-[14px] leading-[21px] text-muted-foreground">

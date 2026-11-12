@@ -14,6 +14,8 @@ import {
   nativeRedirect,
   type ProviderDevice,
   providerErrorMessage,
+  providerIcon,
+  providerLabel,
   providerRows,
   signInMethods,
   startProviderSignIn,
@@ -172,10 +174,18 @@ test('a wrong link password keeps the token; a spent token starts over', async (
 })
 
 test('sign-in methods list the password, then the connected providers', () => {
-  const account = (provider: 'google' | 'github') => ({ provider, email: 'ada', created_at: '2026-01-01T00:00:00Z' })
+  const account = (provider: 'google' | 'github' | 'oidc') => ({ provider, email: 'ada', created_at: '2026-01-01T00:00:00Z' })
   expect(signInMethods(true, [account('github'), account('google')])).toEqual(['Password', 'Google', 'GitHub'])
   expect(signInMethods(false, [account('github')])).toEqual(['GitHub'])
   expect(signInMethods(undefined, [])).toEqual(['Password'])
+  // OpenID Connect shows the admin's label, else a generic name
+  expect(signInMethods(false, [account('oidc'), account('google')], 'Authentik')).toEqual(['Google', 'Authentik'])
+  expect(signInMethods(false, [account('oidc')])).toEqual(['SSO'])
+})
+
+test('OpenID Connect has the admin label and a key icon', () => {
+  expect([providerLabel('oidc', 'Authentik'), providerLabel('oidc', null), providerLabel('github', 'Authentik')]).toEqual(['Authentik', 'SSO', 'GitHub'])
+  expect([providerIcon('oidc'), providerIcon('google')]).toEqual(['key', 'google'])
 })
 
 test('error codes read as sentences; unknown codes keep the server detail', () => {
@@ -209,6 +219,10 @@ test('connected accounts list configured providers, plus a connected one no long
     { provider: 'github', account: github },
   ])
   expect(providerRows([], [])).toEqual([])
+  expect(providerRows(['oidc', 'google'], [])).toEqual([
+    { provider: 'google', account: null },
+    { provider: 'oidc', account: null },
+  ])
 })
 
 test('a server field is worth asking once it has a dot, a port, or is localhost', () => {

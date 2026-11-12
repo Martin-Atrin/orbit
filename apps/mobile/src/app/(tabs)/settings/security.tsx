@@ -6,7 +6,7 @@ import { Image, Linking, Share, View } from 'react-native'
 import { ConfirmDialog, type ConfirmRequest, Dialog, PromptDialog, type PromptRequest } from '../../../components/settings/Dialog'
 import { ACCOUNT_NAV, Badge, Note, RowIcon, RowText, SettingsCard, SettingsRow, SettingsShell } from '../../../components/settings/Shell'
 import { accountKeys, type PasskeyRecord, passkeyAgo, type TotpSetup, twoFactorSummary } from '../../../data/account-api'
-import { type Provider, PROVIDER_LABEL, type ProviderOutcome, providerErrorMessage, providerRows, startProviderSignIn, withReauthentication } from '../../../data/sign-in-provider'
+import { type Provider, type ProviderOutcome, providerErrorMessage, providerIcon, providerLabel, providerRows, startProviderSignIn, withReauthentication } from '../../../data/sign-in-provider'
 import { useAuthOptions, useConfirmIdentity, useConnectedAccounts, useDeletePasskey, useDisconnectAccount, usePasskeys, useTwoFactor, useTwoFactorWrites } from '../../../hooks/account'
 import { useOrbit } from '../../../orbit-context'
 import { errorMessage } from '../../../session-context'
@@ -38,6 +38,7 @@ export default function SecurityScreen() {
   const removePasskey = useDeletePasskey()
   const enabled = status.data?.totp_enabled === true
   const rows = providerRows(options.data?.providers ?? [], accounts.data ?? [])
+  const label = (provider: Provider) => providerLabel(provider, options.data?.oidc_name)
 
   const confirmIdentity = useConfirmIdentity()
 
@@ -64,11 +65,11 @@ export default function SecurityScreen() {
   /** A connected account is a new way into the account: one with a password confirms it first. */
   const connect = (provider: Provider) => {
     setAccountsError(null)
-    const label = PROVIDER_LABEL[provider]
+    const name = label(provider)
     if (user.has_password) {
       return setPrompt({
-        title: `Connect ${label}`,
-        description: `Confirm your password, then sign in with ${label}.`,
+        title: `Connect ${name}`,
+        description: `Confirm your password, then sign in with ${name}.`,
         label: 'Current password',
         confirmLabel: 'Continue',
         secure: true,
@@ -87,8 +88,8 @@ export default function SecurityScreen() {
 
   const askDisconnect = (provider: Provider) =>
     setConfirm({
-      title: `Disconnect ${PROVIDER_LABEL[provider]}?`,
-      description: `You can no longer sign in to Orbit with ${PROVIDER_LABEL[provider]}.`,
+      title: `Disconnect ${label(provider)}?`,
+      description: `You can no longer sign in to Orbit with ${label(provider)}.`,
       confirmLabel: 'Disconnect',
       danger: true,
       onConfirm: () => {
@@ -191,8 +192,8 @@ export default function SecurityScreen() {
         <SettingsCard title="Connected accounts" description="Sign in to Orbit with these accounts instead of a password." flush>
           {rows.map(({ provider, account }, index) => (
             <SettingsRow key={provider} first={index === 0}>
-              <RowIcon icon={provider} />
-              <RowText title={PROVIDER_LABEL[provider]} subtitle={account ? (account.email ?? 'Connected') : 'Not connected'} />
+              <RowIcon icon={providerIcon(provider)} />
+              <RowText title={label(provider)} subtitle={account ? (account.email ?? 'Connected') : 'Not connected'} />
               {account ? (
                 <Button label="Disconnect" variant="outline" size="sm" disabled={disconnect.isPending} onPress={() => askDisconnect(provider)} />
               ) : (
