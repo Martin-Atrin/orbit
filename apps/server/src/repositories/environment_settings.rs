@@ -88,6 +88,7 @@ impl EnvironmentSettings {
                     provider,
                     client_id: client.client_id.clone(),
                     client_secret: seal(client.client_secret.expose())?,
+                    oidc: None,
                 });
             }
         }

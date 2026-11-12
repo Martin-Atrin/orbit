@@ -13889,7 +13889,7 @@
         "tags": [
           "crate::auth_routes::providers"
         ],
-        "summary": "Starts a provider flow. Problems: 404 `provider_not_configured`, 422 `invalid_code_challenge`,\n`invalid_redirect` or `invalid_return_to`, 401 `authentication_required` for `connect` and `confirm`, and for\n`connect` 401 `password_required`, `invalid_credentials` or `reauthentication_required` and 429\n`authentication_throttled`.",
+        "summary": "Starts a provider flow. Problems: 404 `provider_not_configured`, 422 `invalid_code_challenge`,\n`invalid_redirect` or `invalid_return_to`, 401 `authentication_required` for `connect` and `confirm`, and for\n`connect` 401 `password_required`, `invalid_credentials` or `reauthentication_required` and 429\n`authentication_throttled`; 502 `provider_failed` when an OIDC provider's discovery fails.",
         "operationId": "start_provider_sign_in",
         "parameters": [
           {
@@ -14013,6 +14013,16 @@
           },
           "500": {
             "description": "internal_error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProblem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "provider_failed",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -64502,6 +64512,13 @@
             "type": "boolean",
             "description": "Mail is on (Admin → Inbound mail). Off: the mail app and its settings are hidden."
           },
+          "oidc_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The button label of the `oidc` provider (\"Continue with Authentik\"); `null` when it is not in `providers`."
+          },
           "passkeys_enabled": {
             "type": "boolean",
             "description": "People can add passkeys and sign in with them (the public origin is a domain name)."
@@ -70088,7 +70105,7 @@
             "items": {
               "$ref": "#/components/schemas/SignInProviderView"
             },
-            "description": "The Google and GitHub OAuth clients that are saved. A provider that is not listed is off."
+            "description": "The Google, GitHub and OpenID Connect clients that are saved. A provider that is not listed is off."
           },
           "smtp": {
             "oneOf": [
@@ -78378,7 +78395,8 @@
         "type": "string",
         "enum": [
           "google",
-          "github"
+          "github",
+          "oidc"
         ]
       },
       "PtrAddress": {
@@ -81475,7 +81493,7 @@
         "properties": {
           "client_id": {
             "type": "string",
-            "description": "The OAuth client ID from Google Cloud or the GitHub OAuth App."
+            "description": "The OAuth client ID from Google Cloud, the GitHub OAuth App or the OpenID Connect provider."
           },
           "client_secret": {
             "type": [
@@ -81483,6 +81501,27 @@
               "null"
             ],
             "description": "Absent or empty: keep the saved secret. Required the first time."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only, required: the button label, at most 40 characters (\"Authentik\")."
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only, required: the issuer URL (`https`). Orbit reads `{issuer}/.well-known/openid-configuration`\non save, and its `issuer` must be the same string."
+          },
+          "scopes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only: more scopes, separated by spaces. Orbit always asks for `openid email profile`."
           }
         },
         "additionalProperties": false
@@ -81503,8 +81542,29 @@
           "client_id": {
             "type": "string"
           },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only: the button label (\"Continue with Authentik\")."
+          },
+          "issuer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only: the issuer URL."
+          },
           "provider": {
             "$ref": "#/components/schemas/Provider"
+          },
+          "scopes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`oidc` only: the scopes Orbit asks for on top of `openid email profile`, space-separated."
           },
           "secret_set": {
             "type": "boolean",

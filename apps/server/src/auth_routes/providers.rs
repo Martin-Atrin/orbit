@@ -1,4 +1,4 @@
-//! Sign in with Google and GitHub: start, the provider's callback, and the exchange where Orbit decides.
+//! Sign in with Google, GitHub and OpenID Connect: start, the provider's callback, and the exchange where Orbit decides.
 //!
 //! The callback never signs anyone in. It talks to the provider and parks the outcome behind a one-time handoff
 //! code bound to the client that started (the S256 challenge of a verifier only that client holds). Web and native
@@ -30,8 +30,8 @@ use crate::repositories::sign_in_providers::{
 };
 use crate::secret_box::decrypt_secret;
 use crate::sign_in_providers::{
-    Freshness, Provider, ProviderCredentials, ProviderFailure, ProviderProfile, is_pkce_challenge,
-    pkce_challenge, pkce_verifier,
+    AuthorizationRequest, Freshness, OidcCheck, Provider, ProviderCredentials, ProviderFailure,
+    ProviderProfile, is_pkce_challenge, pkce_challenge, pkce_verifier,
 };
 
 /// Provider consent (with the provider's own sign-in and second factor) can take longer than five minutes.
@@ -72,9 +72,16 @@ pub(super) struct ProviderFlow {
     return_to: Option<String>,
 }
 
+/// A provider the sign-in pages offer.
+pub(super) struct ConfiguredProvider {
+    pub provider: Provider,
+    /// OIDC: the button label the admin chose.
+    pub display_name: Option<String>,
+}
+
 /// The configured providers whose secret this server can open. None without an app key, and none whose secret was
 /// saved under another key, so the sign-in page never offers a button that cannot work.
-pub(super) async fn configured(state: &AuthState) -> Result<Vec<Provider>, sqlx::Error> {
+pub(super) async fn configured(state: &AuthState) -> Result<Vec<ConfiguredProvider>, sqlx::Error> {
     let Some(app_key) = state.app_key.as_ref() else {
         return Ok(Vec::new());
     };
@@ -84,7 +91,10 @@ pub(super) async fn configured(state: &AuthState) -> Result<Vec<Provider>, sqlx:
         .into_iter()
         .filter_map(|saved| {
             let provider = saved.provider;
-            open(app_key, saved).map(|_| provider)
+            open(app_key, saved).map(|credentials| ConfiguredProvider {
+                provider,
+                display_name: credentials.oidc.map(|oidc| oidc.display_name),
+            })
         })
         .collect())
 }
@@ -108,6 +118,7 @@ fn open(app_key: &[u8; 32], saved: SavedSignInProvider) -> Option<ProviderCreden
     Some(ProviderCredentials {
         client_id: saved.client_id,
         client_secret,
+        oidc: saved.oidc,
     })
 }
 
@@ -182,8 +193,8 @@ pub(super) struct StartProviderResponse {
 /// Starts a provider flow. Problems: 404 `provider_not_configured`, 422 `invalid_code_challenge`,
 /// `invalid_redirect` or `invalid_return_to`, 401 `authentication_required` for `connect` and `confirm`, and for
 /// `connect` 401 `password_required`, `invalid_credentials` or `reauthentication_required` and 429
-/// `authentication_throttled`.
-#[utoipa::path(post, path = "/api/v1/auth/providers/{provider}/start", params(("provider" = Provider, Path)), request_body = StartProviderBody, responses((status = 200, body = StartProviderResponse), (status = 401, description = "authentication_required, invalid_credentials, password_required or reauthentication_required", body = ProblemBody, content_type = "application/problem+json"), (status = 404, description = "provider_not_configured", body = ProblemBody, content_type = "application/problem+json"), (status = 422, description = "invalid_code_challenge, invalid_redirect or invalid_return_to", body = ProblemBody, content_type = "application/problem+json"), (status = 429, description = "authentication_throttled", body = ProblemBody, content_type = "application/problem+json"), (status = 503, description = "authentication_busy", body = ProblemBody, content_type = "application/problem+json")))]
+/// `authentication_throttled`; 502 `provider_failed` when an OIDC provider's discovery fails.
+#[utoipa::path(post, path = "/api/v1/auth/providers/{provider}/start", params(("provider" = Provider, Path)), request_body = StartProviderBody, responses((status = 200, body = StartProviderResponse), (status = 401, description = "authentication_required, invalid_credentials, password_required or reauthentication_required", body = ProblemBody, content_type = "application/problem+json"), (status = 404, description = "provider_not_configured", body = ProblemBody, content_type = "application/problem+json"), (status = 422, description = "invalid_code_challenge, invalid_redirect or invalid_return_to", body = ProblemBody, content_type = "application/problem+json"), (status = 429, description = "authentication_throttled", body = ProblemBody, content_type = "application/problem+json"), (status = 502, description = "provider_failed: an OIDC provider's discovery document cannot be read", body = ProblemBody, content_type = "application/problem+json"), (status = 503, description = "authentication_busy", body = ProblemBody, content_type = "application/problem+json")))]
 pub(super) async fn start_provider_sign_in(
     State(state): State<AuthState>,
     headers: HeaderMap,
@@ -266,6 +277,7 @@ pub(super) async fn start_provider_sign_in(
     };
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
+    let nonce = orbit_platform::generate_opaque_token();
     let flow = ProviderFlow {
         provider,
         intent,
@@ -279,20 +291,39 @@ pub(super) async fn start_provider_sign_in(
             Pending::ProviderAuthorization {
                 flow,
                 pkce_verifier: verifier,
+                nonce: nonce.clone(),
+                started_at: TimestampMillis::now().as_millis() / 1_000,
             },
             AUTHORIZATION_LIFETIME_MILLIS,
         )
         .await
         .map_err(|error| ApiError::internal(START, rid).cause(error))?
         .ok_or_else(|| busy(START, rid))?;
-    let url = state.providers.authorization_url(
-        provider,
-        &credentials.client_id,
-        &provider.callback_url(&state.public_origin),
-        &state_token,
-        &challenge,
-        freshness,
-    );
+    let url = state
+        .providers
+        .authorization_url(
+            provider,
+            &credentials,
+            &AuthorizationRequest {
+                redirect_uri: &provider.callback_url(&state.public_origin),
+                state: &state_token,
+                pkce_challenge: &challenge,
+                nonce: &nonce,
+                freshness,
+            },
+        )
+        .await
+        .map_err(|_| {
+            // The parked flow expires on its own.
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "provider_failed",
+                "Provider unavailable",
+                "The sign-in provider cannot be reached. Try again in a moment.",
+                START,
+                rid,
+            )
+        })?;
     Ok(Json(StartProviderResponse {
         authorize_url: url.into(),
     }))
@@ -341,6 +372,8 @@ pub(super) async fn provider_callback(
         Pending::ProviderAuthorization {
             flow,
             pkce_verifier,
+            nonce,
+            started_at,
         },
     ))) = state.pending.take(&state_token).await
     else {
@@ -360,6 +393,14 @@ pub(super) async fn provider_callback(
                         &flow.provider.callback_url(&state.public_origin),
                         &code,
                         &pkce_verifier,
+                        &OidcCheck {
+                            nonce: &nonce,
+                            authenticated_since: matches!(
+                                flow.intent,
+                                ProviderIntent::Confirm { .. }
+                            )
+                            .then_some(started_at),
+                        },
                     )
                     .await
             }

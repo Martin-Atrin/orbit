@@ -1335,7 +1335,7 @@ export const providerCallback = <ThrowOnError extends boolean = false>(options: 
  * Starts a provider flow. Problems: 404 `provider_not_configured`, 422 `invalid_code_challenge`,
  * `invalid_redirect` or `invalid_return_to`, 401 `authentication_required` for `connect` and `confirm`, and for
  * `connect` 401 `password_required`, `invalid_credentials` or `reauthentication_required` and 429
- * `authentication_throttled`.
+ * `authentication_throttled`; 502 `provider_failed` when an OIDC provider's discovery fails.
  */
 export const startProviderSignIn = <ThrowOnError extends boolean = false>(options: Options<StartProviderSignInData, ThrowOnError>): RequestResult<StartProviderSignInResponses, StartProviderSignInErrors, ThrowOnError> => (options.client ?? client).post<StartProviderSignInResponses, StartProviderSignInErrors, ThrowOnError>({
     security: [{

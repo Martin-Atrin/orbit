@@ -43,7 +43,9 @@ use crate::repositories::instance_settings::{
 use crate::repositories::sign_in_providers::SaveSignInProviderError;
 use crate::repositories::workspace_storage::{WorkspaceStorageError, WorkspaceStorageRepository};
 use crate::repositories::workspaces::{InvitationDelivery, WorkspaceError, WorkspaceRepository};
-use crate::sign_in_providers::Provider;
+use crate::sign_in_providers::{
+    OIDC_DISPLAY_NAME_MAX, OidcSettings, Provider, ProviderClient, oidc_extra_scopes, oidc_issuer,
+};
 
 #[derive(Clone)]
 pub struct WorkspaceState {
@@ -1838,7 +1840,7 @@ struct InstanceSettingsView {
     storage: StorageView,
     limits: LimitsView,
     mail: InstanceMailView,
-    /// The Google and GitHub OAuth clients that are saved. A provider that is not listed is off.
+    /// The Google, GitHub and OpenID Connect clients that are saved. A provider that is not listed is off.
     sign_in_providers: Vec<SignInProviderView>,
     /// The settings that `ORBIT_*` environment variables set. They replace the saved values, and changing them
     /// here gives 409 `set_by_environment`.
@@ -1919,6 +1921,12 @@ struct SignInProviderView {
     secret_set: bool,
     /// The redirect URI to register at the provider.
     callback_url: String,
+    /// `oidc` only: the button label ("Continue with Authentik").
+    display_name: Option<String>,
+    /// `oidc` only: the issuer URL.
+    issuer: Option<String>,
+    /// `oidc` only: the scopes Orbit asks for on top of `openid email profile`, space-separated.
+    scopes: Option<String>,
 }
 
 /// Limits for a shared installation. `null` is unlimited.
@@ -1979,6 +1987,9 @@ async fn settings_view(
             client_id: saved.client_id,
             secret_set: !saved.client_secret.is_empty(),
             callback_url: saved.provider.callback_url(&state.public_origin),
+            display_name: saved.oidc.as_ref().map(|oidc| oidc.display_name.clone()),
+            issuer: saved.oidc.as_ref().map(|oidc| oidc.issuer.clone()),
+            scopes: saved.oidc.map(|oidc| oidc.scopes),
         })
         .collect();
     let moving = state
@@ -2467,14 +2478,56 @@ async fn reload_storage(
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct SignInProviderBody {
-    /// The OAuth client ID from Google Cloud or the GitHub OAuth App.
+    /// The OAuth client ID from Google Cloud, the GitHub OAuth App or the OpenID Connect provider.
     client_id: String,
     /// Absent or empty: keep the saved secret. Required the first time.
     client_secret: Option<String>,
+    /// `oidc` only, required: the button label, at most 40 characters ("Authentik").
+    display_name: Option<String>,
+    /// `oidc` only, required: the issuer URL (`https`). Orbit reads `{issuer}/.well-known/openid-configuration`
+    /// on save, and its `issuer` must be the same string.
+    issuer: Option<String>,
+    /// `oidc` only: more scopes, separated by spaces. Orbit always asks for `openid email profile`.
+    scopes: Option<String>,
+}
+
+/// The checked OIDC part of a save: label, issuer and scopes, and a discovery document that names the same issuer.
+async fn oidc_settings(body: &SignInProviderBody) -> Result<OidcSettings, String> {
+    let display_name = body.display_name.as_deref().unwrap_or_default().trim();
+    if display_name.is_empty()
+        || display_name.chars().count() > OIDC_DISPLAY_NAME_MAX
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "display_name: enter the button label (at most {OIDC_DISPLAY_NAME_MAX} characters)."
+        ));
+    }
+    let issuer =
+        oidc_issuer(body.issuer.as_deref().unwrap_or_default()).map_err(|error| error.0)?;
+    let scopes =
+        oidc_extra_scopes(body.scopes.as_deref().unwrap_or_default()).map_err(|error| error.0)?;
+    ProviderClient::default()
+        .discover(&issuer)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(OidcSettings {
+        display_name: display_name.to_owned(),
+        issuer,
+        scopes,
+    })
+}
+
+/// The variables that set `provider` from the environment. OpenID Connect has none.
+fn provider_variables(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Google => Some("ORBIT_GOOGLE_CLIENT_ID"),
+        Provider::Github => Some("ORBIT_GITHUB_CLIENT_ID"),
+        Provider::Oidc => None,
+    }
 }
 
 fn invalid_sign_in_provider(
-    detail: &'static str,
+    detail: impl Into<std::borrow::Cow<'static, str>>,
     instance: &str,
     request_id: Option<&Extension<RequestId>>,
 ) -> ApiError {
@@ -2496,7 +2549,7 @@ fn sign_in_provider_not_found(
         StatusCode::NOT_FOUND,
         "provider_not_found",
         "Unknown provider",
-        "Orbit can sign in with google or github.",
+        "Orbit can sign in with google, github or oidc.",
         instance,
         request_id,
     )
@@ -2517,14 +2570,11 @@ async fn save_sign_in_provider(
     let session = require_root(&state, &headers, instance, rid).await?;
     let provider =
         Provider::parse(&provider).ok_or_else(|| sign_in_provider_not_found(instance, rid))?;
-    if EnvironmentSettings::of(state.identity.database())
-        .sign_in_provider(provider)
-        .is_some()
-    {
-        let variables = match provider {
-            Provider::Google => "ORBIT_GOOGLE_CLIENT_ID",
-            Provider::Github => "ORBIT_GITHUB_CLIENT_ID",
-        };
+    if let Some(variables) = provider_variables(provider).filter(|_| {
+        EnvironmentSettings::of(state.identity.database())
+            .sign_in_provider(provider)
+            .is_some()
+    }) {
         return Err(set_by_environment(variables, instance, rid));
     }
     let client_id = body.client_id.trim();
@@ -2535,6 +2585,22 @@ async fn save_sign_in_provider(
             rid,
         ));
     }
+    let oidc = if provider == Provider::Oidc {
+        Some(
+            oidc_settings(&body)
+                .await
+                .map_err(|detail| invalid_sign_in_provider(detail, instance, rid))?,
+        )
+    } else {
+        if body.display_name.is_some() || body.issuer.is_some() || body.scopes.is_some() {
+            return Err(invalid_sign_in_provider(
+                "display_name, issuer and scopes are only for oidc.",
+                instance,
+                rid,
+            ));
+        }
+        None
+    };
     let key = state
         .mailer
         .as_ref()
@@ -2561,6 +2627,7 @@ async fn save_sign_in_provider(
             provider,
             client_id,
             encrypted,
+            oidc.as_ref(),
             request_id_value(rid),
             TimestampMillis::now(),
         )
@@ -2587,14 +2654,11 @@ async fn remove_sign_in_provider(
     let session = require_root(&state, &headers, instance, rid).await?;
     let provider =
         Provider::parse(&provider).ok_or_else(|| sign_in_provider_not_found(instance, rid))?;
-    if EnvironmentSettings::of(state.identity.database())
-        .sign_in_provider(provider)
-        .is_some()
-    {
-        let variables = match provider {
-            Provider::Google => "ORBIT_GOOGLE_CLIENT_ID",
-            Provider::Github => "ORBIT_GITHUB_CLIENT_ID",
-        };
+    if let Some(variables) = provider_variables(provider).filter(|_| {
+        EnvironmentSettings::of(state.identity.database())
+            .sign_in_provider(provider)
+            .is_some()
+    }) {
         return Err(set_by_environment(variables, instance, rid));
     }
     InstanceSettingsRepository::new(state.identity.database().clone())

@@ -458,6 +458,10 @@ export type AuthOptions = {
      */
     mail_enabled: boolean;
     /**
+     * The button label of the `oidc` provider ("Continue with Authentik"); `null` when it is not in `providers`.
+     */
+    oidc_name?: string | null;
+    /**
      * People can add passkeys and sign in with them (the public origin is a domain name).
      */
     passkeys_enabled: boolean;
@@ -2843,7 +2847,7 @@ export type InstanceSettingsView = {
      */
     registration_ready: boolean;
     /**
-     * The Google and GitHub OAuth clients that are saved. A provider that is not listed is off.
+     * The Google, GitHub and OpenID Connect clients that are saved. A provider that is not listed is off.
      */
     sign_in_providers: Array<SignInProviderView>;
     smtp?: null | SmtpView;
@@ -6105,7 +6109,7 @@ export type ProjectUpdateBody = {
     private?: boolean | null;
 };
 
-export type Provider = 'google' | 'github';
+export type Provider = 'google' | 'github' | 'oidc';
 
 export type PtrAddress = {
     ip: string;
@@ -7437,13 +7441,26 @@ export type SignInIntent = 'sign_in' | 'connect' | 'confirm';
 
 export type SignInProviderBody = {
     /**
-     * The OAuth client ID from Google Cloud or the GitHub OAuth App.
+     * The OAuth client ID from Google Cloud, the GitHub OAuth App or the OpenID Connect provider.
      */
     client_id: string;
     /**
      * Absent or empty: keep the saved secret. Required the first time.
      */
     client_secret?: string | null;
+    /**
+     * `oidc` only, required: the button label, at most 40 characters ("Authentik").
+     */
+    display_name?: string | null;
+    /**
+     * `oidc` only, required: the issuer URL (`https`). Orbit reads `{issuer}/.well-known/openid-configuration`
+     * on save, and its `issuer` must be the same string.
+     */
+    issuer?: string | null;
+    /**
+     * `oidc` only: more scopes, separated by spaces. Orbit always asks for `openid email profile`.
+     */
+    scopes?: string | null;
 };
 
 export type SignInProviderView = {
@@ -7452,7 +7469,19 @@ export type SignInProviderView = {
      */
     callback_url: string;
     client_id: string;
+    /**
+     * `oidc` only: the button label ("Continue with Authentik").
+     */
+    display_name?: string | null;
+    /**
+     * `oidc` only: the issuer URL.
+     */
+    issuer?: string | null;
     provider: Provider;
+    /**
+     * `oidc` only: the scopes Orbit asks for on top of `openid email profile`, space-separated.
+     */
+    scopes?: string | null;
     /**
      * A client secret is saved. The secret itself is never returned.
      */
@@ -15445,6 +15474,10 @@ export type StartProviderSignInErrors = {
      * internal_error
      */
     500: AuthProblem;
+    /**
+     * provider_failed
+     */
+    502: AuthProblem;
     /**
      * authentication_busy
      */

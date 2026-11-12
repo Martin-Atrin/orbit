@@ -1,4 +1,4 @@
-//! Sign in with Google and GitHub: the identities that link a provider account to an Orbit account, the decision a
+//! Sign in with Google, GitHub and OpenID Connect: the identities that link a provider account to an Orbit account, the decision a
 //! provider sign-in makes, and the OAuth clients an admin saved.
 
 use orbit_platform::{
@@ -13,7 +13,7 @@ use super::environment_settings::EnvironmentSettings;
 use super::identity::{IdentityRepository, NO_PASSWORD, insert_session};
 use super::instance_settings::InstanceSettingsRepository;
 use crate::audit::{self, AuditOutcome};
-use crate::sign_in_providers::{Provider, ProviderProfile};
+use crate::sign_in_providers::{OidcSettings, Provider, ProviderProfile};
 
 /// Why a provider sign-in cannot continue to an account.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +129,18 @@ pub struct SavedSignInProvider {
     pub provider: Provider,
     pub client_id: String,
     pub client_secret: Vec<u8>,
+    /// `Some` exactly for [`Provider::Oidc`].
+    pub oidc: Option<OidcSettings>,
+}
+
+fn saved_oidc(provider: Provider, row: &sqlx::any::AnyRow) -> Option<OidcSettings> {
+    (provider == Provider::Oidc).then(|| OidcSettings {
+        display_name: row
+            .get::<Option<String>, _>("display_name")
+            .unwrap_or_default(),
+        issuer: row.get::<Option<String>, _>("issuer").unwrap_or_default(),
+        scopes: row.get::<Option<String>, _>("scopes").unwrap_or_default(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -158,16 +170,18 @@ pub(crate) async fn sign_in_methods(
     .await
 }
 
+/// The account of the profile's identity. An OIDC identity counts only for the issuer that made it.
 async fn identity_owner(
     transaction: &mut Transaction<'_, Any>,
-    provider: Provider,
-    subject: &str,
+    profile: &ProviderProfile,
 ) -> Result<Option<Id>, sqlx::Error> {
     let owner = sqlx::query_scalar::<_, String>(
-        "SELECT user_id FROM user_identities WHERE provider = $1 AND subject = $2",
+        "SELECT user_id FROM user_identities WHERE provider = $1 AND subject = $2 \
+         AND issuer IS NOT DISTINCT FROM $3",
     )
-    .bind(provider.as_str())
-    .bind(subject)
+    .bind(profile.provider.as_str())
+    .bind(&profile.subject)
+    .bind(profile.issuer.as_deref())
     .fetch_optional(&mut **transaction)
     .await?;
     owner
@@ -203,14 +217,15 @@ async fn insert_identity(
     now: TimestampMillis,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO user_identities (provider, subject, user_id, email, created_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO user_identities (provider, subject, user_id, email, created_at, issuer) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(profile.provider.as_str())
     .bind(&profile.subject)
     .bind(user_id.to_string())
     .bind(profile.email.as_deref())
     .bind(now.as_millis())
+    .bind(profile.issuer.as_deref())
     .execute(&mut **transaction)
     .await?;
     audit::record_global(
@@ -238,7 +253,7 @@ impl IdentityRepository {
         now: TimestampMillis,
     ) -> Result<ProviderAccount, ProviderSignInError> {
         let mut transaction = self.database().immediate_transaction().await?;
-        let owner = identity_owner(&mut transaction, profile.provider, &profile.subject).await?;
+        let owner = identity_owner(&mut transaction, profile).await?;
         let email_account = match (&owner, &profile.verified_email) {
             (None, Some(email)) => {
                 let account = sqlx::query(
@@ -359,7 +374,7 @@ impl IdentityRepository {
         if active != 1 {
             return Err(SignInRefusal::Suspended.into());
         }
-        let owner = identity_owner(&mut transaction, profile.provider, &profile.subject).await?;
+        let owner = identity_owner(&mut transaction, profile).await?;
         match (owner, link) {
             (Some(owner), _) if owner == user.id => {}
             (None, true) => {
@@ -414,7 +429,7 @@ impl IdentityRepository {
         now: TimestampMillis,
     ) -> Result<(), IdentityChangeError> {
         let mut transaction = self.database().immediate_transaction().await?;
-        match identity_owner(&mut transaction, profile.provider, &profile.subject).await? {
+        match identity_owner(&mut transaction, profile).await? {
             Some(owner) if owner == user_id => return Ok(()),
             Some(_) => return Err(IdentityChangeError::InUse),
             None => {}
@@ -446,9 +461,7 @@ impl IdentityRepository {
         now: TimestampMillis,
     ) -> Result<(), IdentityChangeError> {
         let mut transaction = self.database().immediate_transaction().await?;
-        if identity_owner(&mut transaction, profile.provider, &profile.subject).await?
-            != Some(user_id)
-        {
+        if identity_owner(&mut transaction, profile).await? != Some(user_id) {
             return Err(IdentityChangeError::Mismatch);
         }
         let updated = sqlx::query(
@@ -562,16 +575,19 @@ impl IdentityRepository {
 impl InstanceSettingsRepository {
     pub async fn sign_in_providers(&self) -> Result<Vec<SavedSignInProvider>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT provider, client_id, client_secret FROM sign_in_providers ORDER BY provider",
+            "SELECT provider, client_id, client_secret, display_name, issuer, scopes \
+             FROM sign_in_providers ORDER BY provider",
         )
         .fetch_all(self.database.pool())
         .await?;
         let environment = EnvironmentSettings::of(&self.database);
         let saved = rows.into_iter().filter_map(|row| {
+            let provider = Provider::parse(&row.get::<String, _>("provider"))?;
             Some(SavedSignInProvider {
-                provider: Provider::parse(&row.get::<String, _>("provider"))?,
+                provider,
                 client_id: row.get("client_id"),
                 client_secret: row.get("client_secret"),
+                oidc: saved_oidc(provider, &row),
             })
         });
         let mut providers = environment.sign_in_providers.clone();
@@ -589,7 +605,8 @@ impl InstanceSettingsRepository {
             return Ok(Some(saved.clone()));
         }
         let row = sqlx::query(
-            "SELECT client_id, client_secret FROM sign_in_providers WHERE provider = $1",
+            "SELECT client_id, client_secret, display_name, issuer, scopes FROM sign_in_providers \
+             WHERE provider = $1",
         )
         .bind(provider.as_str())
         .fetch_optional(self.database.pool())
@@ -598,42 +615,61 @@ impl InstanceSettingsRepository {
             provider,
             client_id: row.get("client_id"),
             client_secret: row.get("client_secret"),
+            oidc: saved_oidc(provider, &row),
         }))
     }
 
-    /// Saves the OAuth client. `client_secret: None` keeps the saved secret.
+    /// Saves the OAuth client. `client_secret: None` keeps the saved secret. `oidc` is `Some` exactly for
+    /// [`Provider::Oidc`]; saving another issuer than the one of the connected OIDC identities removes them, since a
+    /// `sub` means nothing at another issuer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one saved provider has this many parts"
+    )]
     pub async fn save_sign_in_provider(
         &self,
         actor_id: Id,
         provider: Provider,
         client_id: &str,
         client_secret: Option<Vec<u8>>,
+        oidc: Option<&OidcSettings>,
         request_id: &str,
         now: TimestampMillis,
     ) -> Result<(), SaveSignInProviderError> {
+        let display_name = oidc.map(|oidc| oidc.display_name.as_str());
+        let issuer = oidc.map(|oidc| oidc.issuer.as_str());
+        let scopes = oidc.map(|oidc| oidc.scopes.as_str());
         let mut transaction = self.database.immediate_transaction().await?;
         match client_secret {
             Some(secret) => {
                 sqlx::query(
-                    "INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $4) ON CONFLICT (provider) DO UPDATE SET \
-                     client_id = excluded.client_id, client_secret = excluded.client_secret, \
-                     updated_at = excluded.updated_at",
+                    "INSERT INTO sign_in_providers (provider, client_id, client_secret, created_at, updated_at, \
+                     display_name, issuer, scopes) VALUES ($1, $2, $3, $4, $4, $5, $6, $7) \
+                     ON CONFLICT (provider) DO UPDATE SET client_id = excluded.client_id, \
+                     client_secret = excluded.client_secret, updated_at = excluded.updated_at, \
+                     display_name = excluded.display_name, issuer = excluded.issuer, scopes = excluded.scopes",
                 )
                 .bind(provider.as_str())
                 .bind(client_id)
                 .bind(secret)
                 .bind(now.as_millis())
+                .bind(display_name)
+                .bind(issuer)
+                .bind(scopes)
                 .execute(&mut *transaction)
                 .await?;
             }
             None => {
                 let updated = sqlx::query(
-                    "UPDATE sign_in_providers SET client_id = $1, updated_at = $2 WHERE provider = $3",
+                    "UPDATE sign_in_providers SET client_id = $1, updated_at = $2, display_name = $4, \
+                     issuer = $5, scopes = $6 WHERE provider = $3",
                 )
                 .bind(client_id)
                 .bind(now.as_millis())
                 .bind(provider.as_str())
+                .bind(display_name)
+                .bind(issuer)
+                .bind(scopes)
                 .execute(&mut *transaction)
                 .await?
                 .rows_affected();
@@ -641,6 +677,19 @@ impl InstanceSettingsRepository {
                     return Err(SaveSignInProviderError::SecretRequired);
                 }
             }
+        }
+        let mut details = serde_json::json!({"provider": provider.as_str()});
+        if let Some(issuer) = issuer {
+            let removed = sqlx::query(
+                "DELETE FROM user_identities WHERE provider = $1 AND issuer IS DISTINCT FROM $2",
+            )
+            .bind(provider.as_str())
+            .bind(issuer)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            details["issuer"] = serde_json::json!(issuer);
+            details["identities_removed"] = serde_json::json!(removed);
         }
         audit::record_global(
             &mut transaction,
@@ -650,7 +699,7 @@ impl InstanceSettingsRepository {
             "installation",
             None,
             request_id,
-            serde_json::json!({"provider": provider.as_str()}),
+            details,
             now,
         )
         .await?;

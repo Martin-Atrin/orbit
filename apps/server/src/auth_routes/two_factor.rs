@@ -63,6 +63,12 @@ pub(super) enum Pending {
         flow: ProviderFlow,
         /// Orbit's PKCE verifier for the provider leg. It never leaves the server.
         pkce_verifier: String,
+        /// The OIDC nonce the ID token must carry back. Empty in flows parked before OIDC existed.
+        #[serde(default)]
+        nonce: String,
+        /// When the flow started, in seconds: a confirmation's ID token must report a sign-in after it.
+        #[serde(default)]
+        started_at: i64,
     },
     /// Keyed by the one-time handoff code: the provider step is over, the client that started picks up the result.
     ProviderHandoff {

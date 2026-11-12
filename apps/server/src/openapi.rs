@@ -877,6 +877,7 @@ fn problem_responses(operation_id: &str) -> BTreeMap<&'static str, String> {
             add_code(&mut responses, "422", "invalid_code_challenge");
             add_code(&mut responses, "422", "invalid_redirect");
             add_code(&mut responses, "422", "invalid_return_to");
+            add_code(&mut responses, "502", "provider_failed");
             add_code(&mut responses, "503", "authentication_busy");
         }
         "exchange_provider_sign_in" => {

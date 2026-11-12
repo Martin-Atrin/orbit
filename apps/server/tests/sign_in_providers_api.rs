@@ -1,11 +1,11 @@
-//! Sign in with Google and GitHub, end to end over the auth and admin routers, against a local stand-in for both
-//! providers that checks the client secret, the redirect URI and PKCE like the real ones.
+//! Sign in with Google, GitHub and OpenID Connect, end to end over the auth and admin routers, against a local
+//! stand-in for the providers that checks the client secret, the redirect URI and PKCE like the real ones.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -40,6 +40,32 @@ enum FakeUser {
         login: &'static str,
         emails: Vec<(&'static str, bool, bool)>,
     },
+    Oidc {
+        sub: &'static str,
+        email: &'static str,
+        verified: bool,
+    },
+}
+
+fn oidc(sub: &'static str, email: &'static str) -> FakeUser {
+    FakeUser::Oidc {
+        sub,
+        email,
+        verified: true,
+    }
+}
+
+/// How the fake OIDC provider misbehaves.
+#[derive(Clone, Default)]
+struct OidcFaults {
+    /// The discovery document reports this issuer instead of its own.
+    reported_issuer: Option<String>,
+    /// The ID token carries another nonce than the authorization request.
+    wrong_nonce: bool,
+    /// The ID token names another audience.
+    wrong_audience: bool,
+    /// Userinfo reports another `sub` than the ID token.
+    userinfo_sub: Option<String>,
 }
 
 fn google(sub: &'static str, email: &'static str) -> FakeUser {
@@ -62,6 +88,9 @@ struct Grant {
     challenge: String,
     redirect_uri: String,
     user: FakeUser,
+    /// OIDC: the nonce and client of the authorization request.
+    nonce: Option<String>,
+    client_id: String,
 }
 
 /// Google and GitHub in one local server. A code is good once and only with the right secret and verifier.
@@ -69,6 +98,25 @@ struct Grant {
 struct FakeProviders {
     grants: Arc<Mutex<HashMap<String, Grant>>>,
     tokens: Arc<Mutex<HashMap<String, FakeUser>>>,
+    oidc_faults: Arc<Mutex<OidcFaults>>,
+}
+
+/// `{scheme}://{host}/oidc/{tenant}`: each tenant is another issuer on the same fake server.
+fn fake_issuer(headers: &HeaderMap, tenant: &str) -> String {
+    format!(
+        "http://{}/oidc/{tenant}",
+        headers[header::HOST].to_str().unwrap()
+    )
+}
+
+/// An unsigned compact JWS: Orbit takes the ID token from the token endpoint over TLS and checks its claims only.
+fn fake_jwt(claims: &Value) -> String {
+    format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string()),
+        URL_SAFE_NO_PAD.encode(b"signature")
+    )
 }
 
 impl FakeProviders {
@@ -94,6 +142,83 @@ impl FakeProviders {
         Json(json!({"access_token": token, "token_type": "bearer"}))
     }
 
+    async fn oidc_discovery(
+        State(fake): State<FakeProviders>,
+        Path(tenant): Path<String>,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        let issuer = fake_issuer(&headers, &tenant);
+        let reported = fake
+            .oidc_faults
+            .lock()
+            .unwrap()
+            .reported_issuer
+            .clone()
+            .unwrap_or_else(|| issuer.clone());
+        Json(json!({
+            "issuer": reported,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "userinfo_endpoint": format!("{issuer}/userinfo"),
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        }))
+    }
+
+    /// The OIDC token endpoint: the client authenticates with HTTP Basic, and the answer has an ID token.
+    async fn oidc_token(
+        State(fake): State<FakeProviders>,
+        Path(tenant): Path<String>,
+        headers: HeaderMap,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let grant = fake.grants.lock().unwrap().remove(&form["code"]);
+        let Some(grant) = grant else {
+            return Json(json!({"error": "invalid_grant"}));
+        };
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{CLIENT_SECRET}", grant.client_id))
+        );
+        if headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            != Some(basic.as_str())
+            || form.contains_key("client_secret")
+            || form["redirect_uri"] != grant.redirect_uri
+            || challenge(&form["code_verifier"]) != grant.challenge
+        {
+            return Json(json!({"error": "invalid_client"}));
+        }
+        let FakeUser::Oidc {
+            sub,
+            email,
+            verified,
+        } = grant.user.clone()
+        else {
+            panic!("not an OIDC user");
+        };
+        let faults = fake.oidc_faults.lock().unwrap().clone();
+        let now = TimestampMillis::now().as_millis() / 1_000;
+        let id_token = fake_jwt(&json!({
+            "iss": fake_issuer(&headers, &tenant),
+            "sub": sub,
+            "aud": if faults.wrong_audience { "someone-else" } else { grant.client_id.as_str() },
+            "exp": now + 300,
+            "iat": now,
+            "auth_time": now,
+            "nonce": if faults.wrong_nonce { "another-nonce".to_owned() } else { grant.nonce.unwrap() },
+            "email": email,
+            "email_verified": verified,
+        }));
+        let token = format!("token-{}", form["code"]);
+        fake.tokens
+            .lock()
+            .unwrap()
+            .insert(token.clone(), grant.user);
+        Json(json!({"access_token": token, "token_type": "Bearer", "id_token": id_token}))
+    }
+
     fn user(&self, headers: &HeaderMap) -> FakeUser {
         let token = headers[header::AUTHORIZATION]
             .to_str()
@@ -106,6 +231,21 @@ impl FakeProviders {
     async fn start() -> (Self, String) {
         let fake = Self::default();
         let router = Router::new()
+            .route(
+                "/oidc/{tenant}/.well-known/openid-configuration",
+                get(Self::oidc_discovery),
+            )
+            .route("/oidc/{tenant}/token", post(Self::oidc_token))
+            .route(
+                "/oidc/{tenant}/userinfo",
+                get(|State(fake): State<FakeProviders>, headers: HeaderMap| async move {
+                    let FakeUser::Oidc { sub, email, verified } = fake.user(&headers) else {
+                        panic!("not an OIDC user");
+                    };
+                    let sub = fake.oidc_faults.lock().unwrap().userinfo_sub.clone().unwrap_or(sub.to_owned());
+                    Json(json!({"sub": sub, "email": email, "email_verified": verified, "name": "Ada OIDC"}))
+                }),
+            )
             .route("/google/token", post(Self::token))
             .route("/github/token", post(Self::token))
             .route(
@@ -164,6 +304,8 @@ impl FakeProviders {
                 challenge: query["code_challenge"].clone(),
                 redirect_uri: query["redirect_uri"].clone(),
                 user,
+                nonce: query.get("nonce").cloned(),
+                client_id: query["client_id"].clone(),
             },
         );
         let callback = query["redirect_uri"].strip_prefix(ORIGIN).unwrap();
@@ -217,6 +359,8 @@ struct Fixture {
     database: TestDatabase,
     app: Router,
     fake: FakeProviders,
+    /// The fake providers' base URL.
+    fake_url: String,
     /// The root account (owner@example.com, with a password).
     owner_cookie: String,
 }
@@ -263,6 +407,7 @@ impl Fixture {
             database,
             app: auth_router(auth).merge(workspace_router(workspaces)),
             fake,
+            fake_url: url,
             owner_cookie: format!("__Host-orbit_session={}", setup.session.token),
         };
         for provider in ["google", "github"] {
@@ -314,6 +459,21 @@ impl Fixture {
             Some(&self.owner_cookie),
             true,
             Some(body),
+        )
+        .await
+    }
+
+    /// The issuer of a fake OIDC tenant.
+    fn issuer(&self, tenant: &str) -> String {
+        format!("{}/oidc/{tenant}", self.fake_url)
+    }
+
+    /// Saves the OIDC provider for the fake tenant `tenant`.
+    async fn save_oidc(&self, tenant: &str) -> Reply {
+        self.admin_save(
+            "oidc",
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik",
+                   "issuer": self.issuer(tenant), "scopes": "groups openid"}),
         )
         .await
     }
@@ -466,9 +626,11 @@ async fn admin_saves_providers_with_an_encrypted_secret_that_an_empty_save_keeps
         saved.body["sign_in_providers"],
         json!([
             {"provider": "github", "client_id": "github-client", "secret_set": true,
-             "callback_url": "https://orbit.test/api/v1/auth/providers/github/callback"},
+             "callback_url": "https://orbit.test/api/v1/auth/providers/github/callback",
+             "display_name": null, "issuer": null, "scopes": null},
             {"provider": "google", "client_id": "google-client-2", "secret_set": true,
-             "callback_url": "https://orbit.test/api/v1/auth/providers/google/callback"},
+             "callback_url": "https://orbit.test/api/v1/auth/providers/google/callback",
+             "display_name": null, "issuer": null, "scopes": null},
         ])
     );
     assert_eq!(
@@ -1457,4 +1619,339 @@ async fn five_wrong_passwords_end_the_link_step() {
             .await,
         0
     );
+}
+
+#[tokio::test]
+async fn oidc_settings_are_checked_and_the_issuer_must_match_discovery() {
+    let fixture = Fixture::new().await;
+    let issuer = fixture.issuer("a");
+    for (body, needle) in [
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "issuer": issuer}),
+            "display_name",
+        ),
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "x".repeat(41), "issuer": issuer}),
+            "display_name",
+        ),
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik"}),
+            "issuer",
+        ),
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik", "issuer": "http://auth.example.com/application/o/orbit/"}),
+            "https",
+        ),
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik", "issuer": format!("{issuer}?tenant=1")}),
+            "query",
+        ),
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik", "issuer": issuer, "scopes": "groups bad\"scope"}),
+            "scopes",
+        ),
+        // The discovery document names the issuer without the trailing slash.
+        (
+            json!({"client_id": "oidc-client", "client_secret": CLIENT_SECRET, "display_name": "Authentik", "issuer": format!("{issuer}/")}),
+            "reports the issuer",
+        ),
+    ] {
+        let reply = fixture.admin_save("oidc", body.clone()).await;
+        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(reply.code(), "invalid_sign_in_provider");
+        let detail = reply.body["detail"].as_str().unwrap();
+        assert!(detail.contains(needle), "{detail}");
+    }
+    // Google and GitHub take no OIDC fields.
+    let google = fixture
+        .admin_save(
+            "google",
+            json!({"client_id": "google-client", "issuer": issuer}),
+        )
+        .await;
+    assert_eq!(google.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let saved = fixture.save_oidc("a").await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    let view = saved.body["sign_in_providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider"] == "oidc")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        view,
+        json!({"provider": "oidc", "client_id": "oidc-client", "secret_set": true,
+               "callback_url": "https://orbit.test/api/v1/auth/providers/oidc/callback",
+               "display_name": "Authentik", "issuer": issuer, "scopes": "groups"})
+    );
+    let options = fixture
+        .send("GET", "/api/v1/auth/options", None, false, None)
+        .await;
+    assert_eq!(
+        options.body["providers"],
+        json!(["github", "google", "oidc"])
+    );
+    assert_eq!(options.body["oidc_name"], "Authentik");
+
+    // An empty secret keeps the saved one; the label can change on its own.
+    let renamed = fixture
+        .admin_save(
+            "oidc",
+            json!({"client_id": "oidc-client", "client_secret": "", "display_name": "Company SSO", "issuer": issuer}),
+        )
+        .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.body);
+    let options = fixture
+        .send("GET", "/api/v1/auth/options", None, false, None)
+        .await;
+    assert_eq!(options.body["oidc_name"], "Company SSO");
+
+    // A provider that later reports another issuer cannot start a sign-in.
+    fixture.fake.oidc_faults.lock().unwrap().reported_issuer =
+        Some("https://evil.example".to_owned());
+    let start = fixture
+        .start(
+            "oidc",
+            json!({"intent": "sign_in", "code_challenge": challenge("x"), "redirect": "web"}),
+            None,
+        )
+        .await;
+    assert_eq!(start.status, StatusCode::BAD_GATEWAY, "{}", start.body);
+    assert_eq!(start.code(), "provider_failed");
+}
+
+#[tokio::test]
+async fn oidc_links_a_verified_email_signs_up_and_disconnects_like_the_others() {
+    let fixture = Fixture::new().await;
+    assert_eq!(fixture.save_oidc("a").await.status, StatusCode::OK);
+
+    // The authorization request is an OIDC code flow with PKCE, a nonce and the extra scopes.
+    let started = fixture
+        .start(
+            "oidc",
+            json!({"intent": "sign_in", "code_challenge": challenge("v"), "redirect": "web"}),
+            None,
+        )
+        .await;
+    let authorize = url::Url::parse(started.body["authorize_url"].as_str().unwrap()).unwrap();
+    assert!(
+        authorize
+            .as_str()
+            .starts_with(&format!("{}/authorize?", fixture.issuer("a")))
+    );
+    let query: HashMap<String, String> = authorize.query_pairs().into_owned().collect();
+    assert_eq!(query["scope"], "openid email profile groups");
+    assert_eq!(query["client_id"], "oidc-client");
+    assert_eq!(query["response_type"], "code");
+    assert_eq!(query["nonce"].len(), 43);
+    assert!(!query.contains_key("prompt"));
+
+    // An unverified email neither links nor signs up.
+    let unverified = fixture
+        .flow(
+            "oidc",
+            "sign_in",
+            FakeUser::Oidc {
+                sub: "o-owner",
+                email: "owner@example.com",
+                verified: false,
+            },
+            None,
+        )
+        .await;
+    assert_eq!(unverified.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(unverified.code(), "provider_email_unverified");
+
+    // A verified email of an existing account: its password confirms the first link.
+    let challenge_reply = fixture
+        .flow(
+            "oidc",
+            "sign_in",
+            oidc("o-owner", "Owner@Example.com"),
+            None,
+        )
+        .await;
+    assert_eq!(challenge_reply.body["provider"], "oidc");
+    let linked = fixture.link(&challenge_reply, PASSWORD, Client::Web).await;
+    assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
+    assert_eq!(
+        fixture
+            .database
+            .scalar::<String>("SELECT issuer FROM user_identities WHERE provider = 'oidc'")
+            .await
+            .unwrap(),
+        fixture.issuer("a")
+    );
+    // From now on the subject signs in, whatever the email.
+    let again = fixture
+        .flow(
+            "oidc",
+            "sign_in",
+            oidc("o-owner", "other@example.com"),
+            None,
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert_eq!(again.body["user"]["email"], "owner@example.com");
+
+    // A new email needs open registration.
+    let closed = fixture
+        .flow("oidc", "sign_in", oidc("o-new", "new@example.com"), None)
+        .await;
+    assert_eq!(closed.status, StatusCode::FORBIDDEN);
+    assert_eq!(closed.code(), "registration_closed");
+    fixture
+        .database
+        .execute("UPDATE instance_settings SET registration_open = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    let signed_up = fixture
+        .flow("oidc", "sign_in", oidc("o-new", "new@example.com"), None)
+        .await;
+    assert_eq!(signed_up.status, StatusCode::OK, "{}", signed_up.body);
+    assert_eq!(signed_up.body["user"]["has_password"], false);
+    assert_eq!(signed_up.body["user"]["display_name"], "Ada OIDC");
+
+    // Connected accounts list the OIDC identity, and the owner (with a password) can disconnect it.
+    let owner = linked.session_cookie();
+    let listed = fixture
+        .send(
+            "GET",
+            "/api/v1/auth/connected-accounts",
+            Some(&owner),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(listed.body[0]["provider"], "oidc");
+    assert_eq!(listed.body[0]["email"], "owner@example.com");
+    let disconnected = fixture
+        .send(
+            "DELETE",
+            "/api/v1/auth/connected-accounts/oidc",
+            Some(&owner),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(disconnected.status, StatusCode::NO_CONTENT);
+    // The new account has no other way in.
+    let last = fixture
+        .send(
+            "DELETE",
+            "/api/v1/auth/connected-accounts/oidc",
+            Some(&signed_up.session_cookie()),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(last.status, StatusCode::CONFLICT);
+    assert_eq!(last.code(), "last_sign_in_method");
+}
+
+#[tokio::test]
+async fn an_oidc_id_token_with_another_nonce_audience_or_subject_is_refused() {
+    let fixture = Fixture::new().await;
+    assert_eq!(fixture.save_oidc("a").await.status, StatusCode::OK);
+    fixture
+        .database
+        .execute("UPDATE instance_settings SET registration_open = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    for faults in [
+        OidcFaults {
+            wrong_nonce: true,
+            ..OidcFaults::default()
+        },
+        OidcFaults {
+            wrong_audience: true,
+            ..OidcFaults::default()
+        },
+        OidcFaults {
+            userinfo_sub: Some("someone-else".to_owned()),
+            ..OidcFaults::default()
+        },
+    ] {
+        *fixture.fake.oidc_faults.lock().unwrap() = faults;
+        let reply = fixture
+            .flow("oidc", "sign_in", oidc("o-1", "new@example.com"), None)
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+        assert_eq!(reply.code(), "provider_failed");
+    }
+    assert_eq!(fixture.scalar_i64("SELECT COUNT(*) FROM users").await, 1);
+    *fixture.fake.oidc_faults.lock().unwrap() = OidcFaults::default();
+    let reply = fixture
+        .flow("oidc", "sign_in", oidc("o-1", "new@example.com"), None)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn another_oidc_issuer_drops_the_identities_of_the_old_one() {
+    let fixture = Fixture::new().await;
+    fixture
+        .database
+        .execute("UPDATE instance_settings SET registration_open = 1 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(fixture.save_oidc("a").await.status, StatusCode::OK);
+    let first = fixture
+        .flow("oidc", "sign_in", oidc("same-sub", "ada@example.com"), None)
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let ada = first.body["user"]["id"].clone();
+    // Removing and saving the same issuer again keeps the connection.
+    let removed = fixture
+        .send(
+            "DELETE",
+            "/api/v1/admin/settings/sign-in-providers/oidc",
+            Some(&fixture.owner_cookie),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::OK);
+    assert_eq!(fixture.save_oidc("a").await.status, StatusCode::OK);
+    assert_eq!(
+        fixture
+            .scalar_i64("SELECT COUNT(*) FROM user_identities WHERE provider = 'oidc'")
+            .await,
+        1
+    );
+
+    // At another issuer, the same `sub` is somebody else: it must not reach Ada's account.
+    assert_eq!(fixture.save_oidc("b").await.status, StatusCode::OK);
+    assert_eq!(
+        fixture
+            .scalar_i64("SELECT COUNT(*) FROM user_identities WHERE provider = 'oidc'")
+            .await,
+        0
+    );
+    let other = fixture
+        .flow("oidc", "sign_in", oidc("same-sub", "bob@example.com"), None)
+        .await;
+    assert_eq!(other.status, StatusCode::OK, "{}", other.body);
+    assert_ne!(other.body["user"]["id"], ada);
+    assert_eq!(other.body["user"]["email"], "bob@example.com");
+}
+
+#[tokio::test]
+async fn an_oidc_confirmation_asks_the_provider_for_a_fresh_sign_in() {
+    let fixture = Fixture::new().await;
+    assert_eq!(fixture.save_oidc("a").await.status, StatusCode::OK);
+    let started = fixture
+        .start(
+            "oidc",
+            json!({"intent": "confirm", "code_challenge": challenge("v"), "redirect": "web"}),
+            Some(&fixture.owner_cookie),
+        )
+        .await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+    let authorize = url::Url::parse(started.body["authorize_url"].as_str().unwrap()).unwrap();
+    let query: HashMap<String, String> = authorize.query_pairs().into_owned().collect();
+    assert_eq!(query["prompt"], "login");
+    assert_eq!(query["max_age"], "0");
 }

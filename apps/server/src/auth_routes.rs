@@ -1686,6 +1686,8 @@ struct AuthOptions {
     mail_enabled: bool,
     /// The sign-in providers an admin configured ("Continue with Google").
     providers: Vec<crate::sign_in_providers::Provider>,
+    /// The button label of the `oidc` provider ("Continue with Authentik"); `null` when it is not in `providers`.
+    oidc_name: Option<String>,
     /// A first sign-in with one of `providers` creates an account (registration is open; no mail server needed).
     provider_registration_open: bool,
     /// The Orbit release this server runs, from `[workspace.package] version` in `Cargo.toml` (for example `0.1.0`).
@@ -1706,9 +1708,16 @@ async fn auth_options(
     let mail_enabled = repository.mail_enabled().await.map_err(|error| {
         ApiError::internal("/api/v1/auth/options", request_id.as_ref()).cause(error)
     })?;
-    let providers = providers::configured(&state).await.map_err(|error| {
+    let configured = providers::configured(&state).await.map_err(|error| {
         ApiError::internal("/api/v1/auth/options", request_id.as_ref()).cause(error)
     })?;
+    let oidc_name = configured
+        .iter()
+        .find_map(|configured| configured.display_name.clone());
+    let providers: Vec<_> = configured
+        .into_iter()
+        .map(|configured| configured.provider)
+        .collect();
     Ok(Json(AuthOptions {
         registration_open: email_enabled && settings.registration_open,
         email_enabled,
@@ -1717,6 +1726,7 @@ async fn auth_options(
         mail_enabled,
         provider_registration_open: settings.registration_open && !providers.is_empty(),
         providers,
+        oidc_name,
         version: env!("CARGO_PKG_VERSION"),
     }))
 }
